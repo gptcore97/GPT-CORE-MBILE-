@@ -1,0 +1,107 @@
+name: Build iOS (IPA non firmato)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Trova il progetto
+        id: p
+        run: |
+          echo "--- File nel repository ---"
+          find . -maxdepth 3 -not -path './.git/*' -not -path '*/node_modules/*' | sort
+          PKG=$(find . -name package.json -not -path '*/node_modules/*' | head -1)
+          if [ -z "$PKG" ]; then
+            echo "ERRORE: package.json non trovato. Carica su GitHub anche package.json, capacitor.config.json e la cartella www." >&2
+            exit 1
+          fi
+          DIR=$(dirname "$PKG")
+          if [ ! -f "$DIR/www/index.html" ]; then
+            echo "ERRORE: manca www/index.html accanto a package.json ($DIR)." >&2
+            exit 1
+          fi
+          echo "Progetto trovato in: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installa dipendenze
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npm install
+
+      - name: Crea il progetto iOS
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npx cap add ios
+
+      - name: Permessi iOS e ritorno da Google (Info.plist)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          import json, plistlib
+          p = 'ios/App/App/Info.plist'
+          d = plistlib.load(open(p, 'rb'))
+          d['NSCameraUsageDescription'] = 'Serve per allegare foto alla chat.'
+          d['NSPhotoLibraryUsageDescription'] = 'Serve per allegare immagini dalla galleria.'
+          d['NSMicrophoneUsageDescription'] = 'Serve per la dettatura vocale e la modalità vocale.'
+          d['NSSpeechRecognitionUsageDescription'] = 'Serve per capire quello che dici in dettatura e in modalità vocale.'
+          d['NSLocalNetworkUsageDescription'] = 'Serve per collegarsi a un server AI nella tua rete locale.'
+          d['UIUserInterfaceStyle'] = 'Dark'
+          d.setdefault('NSAppTransportSecurity', {})['NSAllowsLocalNetworking'] = True
+          try:
+              cid = json.load(open('www/config.json')).get('google', {}).get('ios_client_id', '')
+          except Exception:
+              cid = ''
+          if cid:
+              scheme = 'com.googleusercontent.apps.' + cid.replace('.apps.googleusercontent.com', '')
+              urls = d.setdefault('CFBundleURLTypes', [])
+              if not any(scheme in u.get('CFBundleURLSchemes', []) for u in urls):
+                  urls.append({'CFBundleURLName': 'google-oauth', 'CFBundleURLSchemes': [scheme]})
+              print('Schema registrato:', scheme)
+          else:
+              print('Nessun google.ios_client_id: accesso Google non configurato')
+          plistlib.dump(d, open(p, 'wb'))
+          print(sorted(d.keys()))
+          PY
+
+      - name: Icona e schermata di avvio (facoltativo)
+        working-directory: ${{ steps.p.outputs.dir }}
+        continue-on-error: true
+        run: npx capacitor-assets generate --ios --iconBackgroundColor '#131314' --splashBackgroundColor '#131314'
+
+      - name: Copia i file web
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npx cap sync ios
+
+      - name: Compila (senza firma)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          xcodebuild -workspace ios/App/App.xcworkspace -scheme App \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Crea l'IPA
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          APP=$(find build/Build/Products -name "App.app" -maxdepth 3 | head -1)
+          echo "App trovata: $APP"
+          mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qry GPT-CORE.ipa Payload
+          ls -la GPT-CORE.ipa
+
+      - name: Salva l'IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-core-ipa
+          path: ${{ steps.p.outputs.dir }}/GPT-CORE.ipa

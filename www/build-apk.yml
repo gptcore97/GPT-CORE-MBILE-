@@ -1,0 +1,111 @@
+name: Build Android (APK)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Trova il progetto
+        id: p
+        run: |
+          echo "--- File nel repository ---"
+          find . -maxdepth 3 -not -path './.git/*' -not -path '*/node_modules/*' | sort
+          PKG=$(find . -name package.json -not -path '*/node_modules/*' | head -1)
+          if [ -z "$PKG" ]; then
+            echo "ERRORE: package.json non trovato. Carica su GitHub anche package.json, capacitor.config.json e la cartella www." >&2
+            exit 1
+          fi
+          DIR=$(dirname "$PKG")
+          if [ ! -f "$DIR/www/index.html" ]; then
+            echo "ERRORE: manca www/index.html accanto a package.json ($DIR)." >&2
+            exit 1
+          fi
+          echo "Progetto trovato in: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Installa dipendenze
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npm install
+
+      - name: Crea il progetto Android
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npx cap add android
+
+      - name: Ritorno dall'accesso Google (schema URL)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          import json
+          try:
+              cid = json.load(open('www/config.json')).get('google', {}).get('ios_client_id', '')
+          except Exception:
+              cid = ''
+          if not cid:
+              print('Nessun google.ios_client_id in www/config.json: accesso Google non configurato')
+              raise SystemExit(0)
+          scheme = 'com.googleusercontent.apps.' + cid.replace('.apps.googleusercontent.com', '')
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if scheme not in s:
+              f = ('<intent-filter><action android:name="android.intent.action.VIEW" />'
+                   '<category android:name="android.intent.category.DEFAULT" />'
+                   '<category android:name="android.intent.category.BROWSABLE" />'
+                   '<data android:scheme="%s" /></intent-filter>') % scheme
+              i = s.index('</intent-filter>') + len('</intent-filter>')
+              s = s[:i] + f + s[i:]
+              open(p, 'w', encoding='utf-8').write(s)
+          print('Schema registrato:', scheme)
+          PY
+
+      - name: Permesso microfono (dettatura e modalità vocale)
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          for perm in ('android.permission.RECORD_AUDIO', 'android.permission.MODIFY_AUDIO_SETTINGS'):
+              if perm not in s:
+                  s = s.replace('</manifest>', '    <uses-permission android:name="%s" />\n</manifest>' % perm)
+          if 'android.speech.RecognitionService' not in s:
+              q = '<queries><intent><action android:name="android.speech.RecognitionService" /></intent></queries>'
+              s = s.replace('</manifest>', '    ' + q + '\n</manifest>')
+          open(p, 'w', encoding='utf-8').write(s)
+          print('Permessi audio aggiunti')
+          PY
+
+      - name: Icona e schermata di avvio (facoltativo)
+        working-directory: ${{ steps.p.outputs.dir }}
+        continue-on-error: true
+        run: npx capacitor-assets generate --android --iconBackgroundColor '#131314' --splashBackgroundColor '#131314'
+
+      - name: Copia i file web
+        working-directory: ${{ steps.p.outputs.dir }}
+        run: npx cap sync android
+
+      - name: Compila l'APK
+        working-directory: ${{ steps.p.outputs.dir }}/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Salva l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-core-apk
+          path: ${{ steps.p.outputs.dir }}/android/app/build/outputs/apk/debug/app-debug.apk
